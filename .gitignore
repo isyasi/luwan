@@ -34,3 +34,7 @@ Desktop.ini
 screen_state.json
 screen_state.json.tmp
 *.bak-vision
+
+# local pack artifacts
+_push_pack.zip
+*.zip
