@@ -1,0 +1,36 @@
+﻿# secrets / keys
+密钥.dat
+*.dat
+**/api_key*.txt
+.env
+.env.*
+
+# local runtime & caches
+runtime/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# build / bundled runtime (huge)
+dist/
+
+# animation frames (large binary assets; keep outside git)
+桌宠帧/
+
+# machine-local / ephemeral
+监听状态.json
+桌宠尺寸.txt
+*.log
+*.bak-*
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+screen_state.json
+screen_state.json.tmp
+*.bak-vision
