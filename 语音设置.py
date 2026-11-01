@@ -246,10 +246,33 @@ def main():
     vision_frame = ttk.LabelFrame(left, text='屏幕视觉', padding=8)
     vision_frame.pack(fill='x', padx=6, pady=6)
     vision_enabled = tk.BooleanVar(value=bool(config.get('vision_enabled', False)))
-    vision_interval = tk.StringVar(value=str(config.get('vision_interval_sec', 2)))
+    vision_interval = tk.StringVar(value=str(config.get('vision_interval_sec', 30)))
     vision_cooldown = tk.StringVar(value=str(config.get('vision_cooldown_sec', 8)))
     vision_model = tk.StringVar(value=str(config.get('vision_model', 'qwen3-vl-plus')))
-    vision_status = tk.StringVar(value='关闭时不截图；开启后只保留最新一帧。间隔改完点保存；已开视觉则下次勾选/重启进程生效。')
+    vision_hotkey = tk.StringVar(value=str(config.get('vision_hotkey', 'Ctrl+Alt+V') or 'Ctrl+Alt+V'))
+    vision_gamepad = tk.StringVar(value=str(config.get('vision_gamepad_button', '无') or '无'))
+    # 监视器 / 区域
+    try:
+        from 屏幕视觉 import list_monitors
+        _monitors = list_monitors()
+    except Exception:
+        _monitors = [{'key': 'primary', 'label': '主显示器', 'primary': True}]
+    _monitor_labels = [m.get('label') or m.get('key') for m in _monitors] + ['自定义区域']
+    _label_to_key = {(m.get('label') or m.get('key')): (m.get('key') or 'primary') for m in _monitors}
+    _key_to_label = {(m.get('key') or 'primary'): (m.get('label') or m.get('key')) for m in _monitors}
+    _region = config.get('vision_region') if isinstance(config.get('vision_region'), dict) else {}
+    _mode = str(config.get('vision_capture_mode') or 'monitor').strip().lower()
+    _mon_key = str(config.get('vision_monitor') or 'primary').strip() or 'primary'
+    if _mode == 'region':
+        _src_default = '自定义区域'
+    else:
+        _src_default = _key_to_label.get(_mon_key) or _key_to_label.get('primary') or _monitor_labels[0]
+    vision_source = tk.StringVar(value=_src_default)
+    vision_region_l = tk.StringVar(value=str(_region.get('left', 0)))
+    vision_region_t = tk.StringVar(value=str(_region.get('top', 0)))
+    vision_region_w = tk.StringVar(value=str(_region.get('width', 1280)))
+    vision_region_h = tk.StringVar(value=str(_region.get('height', 720)))
+    vision_status = tk.StringVar(value='关闭时不截图；开启后只保留最新一帧。强制看屏：热键/手柄立刻截当前选区并开口。')
     ttk.Checkbutton(vision_frame, text='启用屏幕视觉（Latest-Frame → Flash 眼睛）', variable=vision_enabled).pack(anchor='w')
     vision_row = ttk.Frame(vision_frame)
     vision_row.pack(fill='x', pady=(6, 0))
@@ -261,13 +284,55 @@ def main():
         width=6,
     )
     vision_interval_box.pack(side='left', padx=(4, 12))
-    # Combobox 可编辑：可选预设，也可手填自定义秒数
     ttk.Label(vision_row, text='开口冷却秒').pack(side='left')
     ttk.Entry(vision_row, textvariable=vision_cooldown, width=6).pack(side='left', padx=(4, 12))
     ttk.Label(vision_row, text='模型').pack(side='left')
     ttk.Entry(vision_row, textvariable=vision_model).pack(side='left', fill='x', expand=True, padx=(4, 0))
+    vision_row2 = ttk.Frame(vision_frame)
+    vision_row2.pack(fill='x', pady=(6, 0))
+    ttk.Label(vision_row2, text='强制看屏热键').pack(side='left')
+    ttk.Entry(vision_row2, textvariable=vision_hotkey, width=14).pack(side='left', padx=(4, 12))
+    ttk.Label(vision_row2, text='手柄键').pack(side='left')
+    ttk.Combobox(
+        vision_row2,
+        textvariable=vision_gamepad,
+        values=('无', 'A', 'B', 'X', 'Y', 'LB', 'RB', 'START', 'BACK'),
+        width=8,
+    ).pack(side='left', padx=(4, 0))
+    vision_row3 = ttk.Frame(vision_frame)
+    vision_row3.pack(fill='x', pady=(6, 0))
+    ttk.Label(vision_row3, text='截图范围').pack(side='left')
+    vision_source_box = ttk.Combobox(
+        vision_row3,
+        textvariable=vision_source,
+        values=tuple(_monitor_labels),
+        state='readonly',
+        width=28,
+    )
+    vision_source_box.pack(side='left', padx=(4, 0))
+    region_row = ttk.Frame(vision_frame)
+    ttk.Label(region_row, text='区域 L').pack(side='left')
+    ttk.Entry(region_row, textvariable=vision_region_l, width=6).pack(side='left', padx=(2, 8))
+    ttk.Label(region_row, text='T').pack(side='left')
+    ttk.Entry(region_row, textvariable=vision_region_t, width=6).pack(side='left', padx=(2, 8))
+    ttk.Label(region_row, text='W').pack(side='left')
+    ttk.Entry(region_row, textvariable=vision_region_w, width=6).pack(side='left', padx=(2, 8))
+    ttk.Label(region_row, text='H').pack(side='left')
+    ttk.Entry(region_row, textvariable=vision_region_h, width=6).pack(side='left', padx=(2, 0))
+    def _toggle_region_row(*_a):
+        if vision_source.get() == '自定义区域':
+            region_row.pack(fill='x', pady=(6, 0))
+        else:
+            region_row.pack_forget()
+    vision_source.trace_add('write', _toggle_region_row)
+    _toggle_region_row()
     ttk.Label(vision_frame, textvariable=vision_status, style='Subtitle.TLabel', wraplength=int(460 * ui_scale)).pack(anchor='w', pady=(6, 0))
-    ttk.Label(vision_frame, text='密钥沿用已保存的云端 Key（默认阿里百炼 VL Flash）；失败不拖垮聊天。', style='Subtitle.TLabel', wraplength=int(460 * ui_scale)).pack(anchor='w', pady=(2, 0))
+    ttk.Label(
+        vision_frame,
+        text='热键默认 Ctrl+Alt+V；手柄按下边沿触发一次。范围对定时截图与强制看屏同时生效。密钥沿用云端 Key。',
+        style='Subtitle.TLabel',
+        wraplength=int(460 * ui_scale),
+    ).pack(anchor='w', pady=(2, 0))
     after_ids = {'vision': None, 'listener': None}
     def _cancel_afters():
         for key, aid in list(after_ids.items()):
@@ -443,9 +508,9 @@ def main():
         data['interrupt_db'] = round(interrupt_db.get())
         data['vision_enabled'] = bool(vision_enabled.get())
         try:
-            data['vision_interval_sec'] = max(0.4, float(vision_interval.get() or 2))
+            data['vision_interval_sec'] = max(0.4, float(vision_interval.get() or 30))
         except ValueError:
-            data['vision_interval_sec'] = 2
+            data['vision_interval_sec'] = 30
         try:
             data['vision_cooldown_sec'] = max(1.0, float(vision_cooldown.get() or 8))
         except ValueError:
@@ -453,6 +518,26 @@ def main():
         data['vision_model'] = (vision_model.get() or 'qwen3-vl-plus').strip()
         data['vision_provider'] = latest.get('vision_provider', '阿里百炼')
         data['vision_base_url'] = latest.get('vision_base_url', 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions')
+        data['vision_hotkey'] = (vision_hotkey.get() or 'Ctrl+Alt+V').strip() or 'Ctrl+Alt+V'
+        gp = (vision_gamepad.get() or '无').strip() or '无'
+        data['vision_gamepad_button'] = '' if gp in ('无', 'NONE', 'none', 'off', '禁用') else gp.upper()
+        src = vision_source.get() or '主显示器'
+        if src == '自定义区域':
+            data['vision_capture_mode'] = 'region'
+            data['vision_monitor'] = latest.get('vision_monitor', 'primary') or 'primary'
+            try:
+                data['vision_region'] = {
+                    'left': int(float(vision_region_l.get() or 0)),
+                    'top': int(float(vision_region_t.get() or 0)),
+                    'width': max(32, int(float(vision_region_w.get() or 1280))),
+                    'height': max(32, int(float(vision_region_h.get() or 720))),
+                }
+            except ValueError:
+                data['vision_region'] = {'left': 0, 'top': 0, 'width': 1280, 'height': 720}
+        else:
+            data['vision_capture_mode'] = 'monitor'
+            data['vision_monitor'] = _label_to_key.get(src, 'primary')
+            data['vision_region'] = None
         temporary = CONFIG.with_suffix('.tmp')
         temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
         temporary.replace(CONFIG)

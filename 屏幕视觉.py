@@ -1,6 +1,7 @@
 """屏幕视觉 v1：Latest-Frame 截图 → Flash 眼睛 → screen_state → ShouldSpeak。
 
 旁路模块：失败全部自吞，不拖垮语音听环。可开关（语音设置.json vision_enabled）。
+支持：全局热键 / 手柄边沿强制看屏开口；多显示器或自定义区域截图。
 """
 from __future__ import annotations
 
@@ -15,6 +16,8 @@ import time
 import traceback
 from pathlib import Path
 
+import ctypes
+import ctypes.wintypes as wintypes
 import requests
 from PIL import Image, ImageGrab
 
@@ -30,7 +33,26 @@ _latest = {'jpeg': None, 'fp': '', 'ts': 0.0}
 _latest_lock = threading.Lock()
 _speak_lock = threading.Lock()
 _last_spoken = {'event_id': '', 'at': 0.0}
+_last_force_at = 0.0
 _stop = threading.Event()
+
+# XInput 按键名 → bitmask
+_XINPUT_BUTTONS = {
+    'DPAD_UP': 0x0001,
+    'DPAD_DOWN': 0x0002,
+    'DPAD_LEFT': 0x0004,
+    'DPAD_RIGHT': 0x0008,
+    'START': 0x0010,
+    'BACK': 0x0020,
+    'LS': 0x0040,
+    'RS': 0x0080,
+    'LB': 0x0100,
+    'RB': 0x0200,
+    'A': 0x1000,
+    'B': 0x2000,
+    'X': 0x4000,
+    'Y': 0x8000,
+}
 
 
 def _http():
@@ -81,9 +103,124 @@ def fingerprint(jpeg: bytes) -> str:
         return hashlib.md5(jpeg).hexdigest()
 
 
+# ---------- 显示器 / 区域 ----------
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ('left', ctypes.c_long),
+        ('top', ctypes.c_long),
+        ('right', ctypes.c_long),
+        ('bottom', ctypes.c_long),
+    ]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ('cbSize', ctypes.c_ulong),
+        ('rcMonitor', _RECT),
+        ('rcWork', _RECT),
+        ('dwFlags', ctypes.c_ulong),
+    ]
+
+
+def list_monitors() -> list[dict]:
+    """返回显示器列表：index/primary/left/top/width/height/label。失败给主屏兜底。"""
+    monitors: list[dict] = []
+    try:
+        user32 = ctypes.windll.user32
+        MonitorEnumProc = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_RECT), ctypes.c_void_p
+        )
+
+        def _callback(hmonitor, _hdc, _lprect, _lparam):
+            info = _MONITORINFO()
+            info.cbSize = ctypes.sizeof(_MONITORINFO)
+            if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+                r = info.rcMonitor
+                primary = bool(info.dwFlags & 1)
+                monitors.append({
+                    'handle': int(hmonitor),
+                    'primary': primary,
+                    'left': int(r.left),
+                    'top': int(r.top),
+                    'width': int(r.right - r.left),
+                    'height': int(r.bottom - r.top),
+                })
+            return 1
+
+        user32.EnumDisplayMonitors(0, 0, MonitorEnumProc(_callback), 0)
+    except Exception:
+        monitors = []
+    if not monitors:
+        try:
+            user32 = ctypes.windll.user32
+            w = int(user32.GetSystemMetrics(0))
+            h = int(user32.GetSystemMetrics(1))
+        except Exception:
+            w, h = 1920, 1080
+        monitors = [{'handle': 0, 'primary': True, 'left': 0, 'top': 0, 'width': w, 'height': h}]
+    # 主屏优先编号
+    monitors.sort(key=lambda m: (not m.get('primary'), m.get('left', 0), m.get('top', 0)))
+    for i, m in enumerate(monitors):
+        m['index'] = i
+        tag = '主显示器' if m.get('primary') else f'显示器 {i + 1}'
+        m['label'] = f"{tag} ({m['width']}x{m['height']})"
+        m['key'] = 'primary' if m.get('primary') else str(i)
+    return monitors
+
+
+def resolve_capture_bbox(cfg: dict | None = None):
+    """根据配置返回 ImageGrab bbox=(l,t,r,b)；None 表示主屏默认 grab。"""
+    cfg = cfg if cfg is not None else _load_config()
+    region = cfg.get('vision_region')
+    mode = (cfg.get('vision_capture_mode') or '').strip().lower()
+    if mode == 'region' or (isinstance(region, dict) and mode != 'monitor'):
+        if isinstance(region, dict):
+            try:
+                left = int(region.get('left', 0))
+                top = int(region.get('top', 0))
+                width = int(region.get('width', 0))
+                height = int(region.get('height', 0))
+                if width >= 32 and height >= 32:
+                    return (left, top, left + width, top + height)
+            except (TypeError, ValueError):
+                pass
+    monitors = list_monitors()
+    want = str(cfg.get('vision_monitor') or 'primary').strip().lower()
+    chosen = None
+    if want in ('primary', 'main', ''):
+        chosen = next((m for m in monitors if m.get('primary')), monitors[0])
+    else:
+        try:
+            idx = int(want)
+            for m in monitors:
+                if m.get('index') == idx:
+                    chosen = m
+                    break
+        except ValueError:
+            for m in monitors:
+                if m.get('key') == want or m.get('label') == want:
+                    chosen = m
+                    break
+    if not chosen:
+        chosen = next((m for m in monitors if m.get('primary')), monitors[0])
+    # 仅一块屏且就是主屏原点时，交给默认 grab
+    if chosen.get('primary') and chosen.get('left') == 0 and chosen.get('top') == 0 and len(monitors) == 1:
+        return None
+    return (
+        int(chosen['left']),
+        int(chosen['top']),
+        int(chosen['left'] + chosen['width']),
+        int(chosen['top'] + chosen['height']),
+    )
+
+
 def capture_jpeg(max_width=960, quality=40, bbox=None) -> bytes | None:
     try:
-        img = ImageGrab.grab(bbox=bbox) if bbox else ImageGrab.grab()
+        if bbox:
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+        else:
+            img = ImageGrab.grab()
         if img.mode != 'RGB':
             img = img.convert('RGB')
         w, h = img.size
@@ -153,20 +290,30 @@ _EYES_PROMPT = (
     '时钟秒数、光标闪烁、视频帧抖动不要 worthy。'
 )
 
+_FORCE_EYES_PROMPT = (
+    '你是桌宠的眼睛。主人刚刚按下「看一眼」热键，请认真描述当前屏幕。'
+    '用简体中文，严格输出一行 JSON（不要 markdown）：'
+    '{"scene":"场景","focus":"焦点窗口或区域","text_points":["可见文字要点最多3条"],'
+    '"change":"other","worthy":true,'
+    '"summary":"不超过40字的中文摘要，要让桌宠能据此开口"}。'
+    'worthy 必须为 true。'
+)
 
-def call_eyes(jpeg: bytes, cfg: dict) -> dict:
+
+def call_eyes(jpeg: bytes, cfg: dict, force: bool = False) -> dict:
     provider, key = _vision_key(cfg)
     if not key:
         return {'ok': False, 'error': 'no_vision_key', 'summary': '未配置视觉密钥'}
     url, model = _vision_endpoint(cfg, provider)
     encoded = 'data:image/jpeg;base64,' + base64.b64encode(jpeg).decode('ascii')
+    prompt = _FORCE_EYES_PROMPT if force else _EYES_PROMPT
     payload = {
         'model': model,
         'messages': [{
             'role': 'user',
             'content': [
                 {'type': 'image_url', 'image_url': {'url': encoded}},
-                {'type': 'text', 'text': _EYES_PROMPT},
+                {'type': 'text', 'text': prompt},
             ],
         }],
         'stream': False,
@@ -207,7 +354,7 @@ def call_eyes(jpeg: bytes, cfg: dict) -> dict:
         points = [str(points)]
     points = [str(p).strip() for p in points if str(p).strip()][:3]
     change = str(parsed.get('change') or 'other').strip()[:32]
-    worthy = bool(parsed.get('worthy'))
+    worthy = True if force else bool(parsed.get('worthy'))
     detail = ' | '.join(x for x in [focus, '；'.join(points)] if x)[:200]
     return {
         'ok': True,
@@ -236,7 +383,6 @@ def is_dialogue_busy() -> bool:
         status = str(info.get('status') or '')
         if any(m in status for m in markers):
             return True
-        # 状态文件很旧则不当忙
         ts = float(info.get('time') or 0)
         if ts and (time.time() - ts) > 120:
             return False
@@ -264,8 +410,8 @@ def should_speak(state: dict, cfg: dict) -> bool:
     return True
 
 
-def proactive_speak(state: dict, cfg: dict) -> bool:
-    """走现有 send → reply → TTS；全程异常自吞。"""
+def proactive_speak(state: dict, cfg: dict, force: bool = False) -> bool:
+    """走现有 send → reply → TTS；全程异常自吞。force 绕过 worthy/冷却/去重。"""
     if not _speak_lock.acquire(blocking=False):
         return False
     try:
@@ -275,23 +421,34 @@ def proactive_speak(state: dict, cfg: dict) -> bool:
         if not sid:
             return False
         from 语音链路 import send, stream_reply, synthesize, play, reply_snapshot, state as set_listen_state, VOICES
-        nudge = (
-            '【视觉事件】我刚扫了一眼屏幕。'
-            '若值得跟主人开口，请用一两句口语简短说；不值得就只回复一个句号。'
-        )
+        if force:
+            nudge = (
+                '【视觉强制】主人刚按了看屏热键/手柄，请根据当前屏幕用一两句口语直接开口回应，'
+                '不要只回句号，不要说「我看不见」。'
+            )
+        else:
+            nudge = (
+                '【视觉事件】我刚扫了一眼屏幕。'
+                '若值得跟主人开口，请用一两句口语简短说；不值得就只回复一个句号。'
+            )
         previous, _ = reply_snapshot(sid)
-        set_listen_state('视觉主动开口：发送中', text=state.get('summary') or '')
+        set_listen_state(
+            '视觉强制开口：发送中' if force else '视觉主动开口：发送中',
+            text=state.get('summary') or '',
+        )
         send(nudge, sid)
         voice = cfg.get('voice') or VOICES.get(cfg.get('tts_provider', ''), ['Cherry'])[0]
         speaker = cfg.get('speaker')
         spoken_len = 0
         for answer, finished in stream_reply(sid, previous):
-            if is_dialogue_busy() and spoken_len == 0:
-                # 用户突然开口则放弃本轮主动念
+            if (not force) and is_dialogue_busy() and spoken_len == 0:
                 break
             tail = (answer or '')[spoken_len:]
             if tail.strip() and tail.strip() not in ('。', '.', '…', '...'):
-                set_listen_state('视觉主动开口：播报中', text=state.get('summary') or '')
+                set_listen_state(
+                    '视觉强制开口：播报中' if force else '视觉主动开口：播报中',
+                    text=state.get('summary') or '',
+                )
                 audio = synthesize(cfg.get('tts_provider') or '阿里百炼', tail, voice)
                 if not play(audio, speaker):
                     break
@@ -313,6 +470,222 @@ def proactive_speak(state: dict, cfg: dict) -> bool:
         _speak_lock.release()
 
 
+def force_look_and_speak() -> bool:
+    """热键/手柄：立刻截当前选中区域 → 眼睛 → 必须主动开口（绕过该次 worthy/冷却/去重）。"""
+    global _last_force_at
+    try:
+        now = time.time()
+        if now - _last_force_at < 0.8:
+            return False
+        _last_force_at = now
+        cfg = _load_config()
+        if not cfg.get('vision_enabled'):
+            return False
+        bbox = resolve_capture_bbox(cfg)
+        jpeg = capture_jpeg(bbox=bbox)
+        if not jpeg:
+            write_screen_state(ok=False, summary='强制看屏：截图失败', detail='capture')
+            return False
+        fp = fingerprint(jpeg)
+        with _latest_lock:
+            _latest['jpeg'] = jpeg
+            _latest['fp'] = fp
+            _latest['ts'] = time.time()
+        eyes = call_eyes(jpeg, cfg, force=True)
+        if not eyes.get('ok'):
+            write_screen_state(
+                ok=False,
+                hash=fp,
+                summary=eyes.get('summary') or '强制看屏：眼睛失败',
+                detail=str(eyes.get('error') or ''),
+                event_id='',
+                worthy=False,
+            )
+            return False
+        event_id = f"force-{int(time.time() * 1000)}"
+        state = write_screen_state(
+            ok=True,
+            ts=time.time(),
+            hash=fp,
+            summary=eyes.get('summary') or '',
+            detail=eyes.get('detail') or '',
+            event_id=event_id,
+            worthy=True,
+            force=True,
+            scene=eyes.get('scene') or '',
+            focus=eyes.get('focus') or '',
+            change=eyes.get('change') or 'other',
+            model=eyes.get('model') or '',
+        )
+        # 强制路径：不经 should_speak
+        ok = proactive_speak(state, cfg, force=True)
+        try:
+            state['spoke'] = bool(ok)
+            _atomic_write(SCREEN_STATE, state)
+        except OSError:
+            pass
+        return ok
+    except Exception:
+        try:
+            write_screen_state(ok=False, summary='强制看屏异常', detail='swallowed')
+        except Exception:
+            pass
+        return False
+
+
+# ---------- 热键 / 手柄 ----------
+
+_VK_NAME = {
+    'ctrl': 0x11, 'control': 0x11,
+    'alt': 0x12, 'menu': 0x12,
+    'shift': 0x10,
+    'win': 0x5B, 'super': 0x5B,
+}
+
+
+def parse_hotkey(spec: str) -> dict:
+    """'Ctrl+Alt+V' → {'mods':[0x11,0x12], 'vk':0x56}。"""
+    parts = [p.strip() for p in (spec or '').replace('-', '+').split('+') if p.strip()]
+    mods = []
+    vk = None
+    for p in parts:
+        low = p.lower()
+        if low in _VK_NAME:
+            mods.append(_VK_NAME[low])
+            continue
+        if len(p) == 1:
+            ch = p.upper()
+            if 'A' <= ch <= 'Z':
+                vk = ord(ch)
+            elif '0' <= ch <= '9':
+                vk = ord(ch)
+            continue
+        if low.startswith('f') and low[1:].isdigit():
+            n = int(low[1:])
+            if 1 <= n <= 24:
+                vk = 0x70 + n - 1
+            continue
+        # 常见别名
+        aliases = {'space': 0x20, 'tab': 0x09, 'esc': 0x1B, 'escape': 0x1B, 'enter': 0x0D, 'return': 0x0D}
+        if low in aliases:
+            vk = aliases[low]
+    if vk is None:
+        vk = ord('V')
+        mods = [_VK_NAME['ctrl'], _VK_NAME['alt']]
+    return {'mods': mods, 'vk': vk}
+
+
+def hotkey_is_down(parsed: dict) -> bool:
+    user32 = ctypes.windll.user32
+    if not parsed or not parsed.get('vk'):
+        return False
+    # 高位表示按下
+    if not (user32.GetAsyncKeyState(int(parsed['vk'])) & 0x8000):
+        return False
+    for mod in parsed.get('mods') or []:
+        if not (user32.GetAsyncKeyState(int(mod)) & 0x8000):
+            return False
+    return True
+
+
+def _load_xinput():
+    for name in ('xinput1_4.dll', 'xinput1_3.dll', 'xinput9_1_0.dll'):
+        try:
+            return ctypes.WinDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+class _XINPUT_GAMEPAD(ctypes.Structure):
+    _fields_ = [
+        ('wButtons', ctypes.c_ushort),
+        ('bLeftTrigger', ctypes.c_ubyte),
+        ('bRightTrigger', ctypes.c_ubyte),
+        ('sThumbLX', ctypes.c_short),
+        ('sThumbLY', ctypes.c_short),
+        ('sThumbRX', ctypes.c_short),
+        ('sThumbRY', ctypes.c_short),
+    ]
+
+
+class _XINPUT_STATE(ctypes.Structure):
+    _fields_ = [
+        ('dwPacketNumber', ctypes.c_ulong),
+        ('Gamepad', _XINPUT_GAMEPAD),
+    ]
+
+
+_xinput = None
+_xinput_tried = False
+
+
+def gamepad_buttons_mask() -> int:
+    """任意已连接手柄的按钮掩码按位或；失败返回 0。"""
+    global _xinput, _xinput_tried
+    if not _xinput_tried:
+        _xinput_tried = True
+        _xinput = _load_xinput()
+    if not _xinput:
+        return 0
+    mask = 0
+    state = _XINPUT_STATE()
+    for i in range(4):
+        try:
+            if _xinput.XInputGetState(i, ctypes.byref(state)) == 0:
+                mask |= int(state.Gamepad.wButtons)
+        except Exception:
+            continue
+    return mask
+
+
+def gamepad_button_down(name: str) -> bool:
+    key = (name or '').strip().upper()
+    if not key or key in ('NONE', 'OFF', '无', '禁用'):
+        return False
+    bit = _XINPUT_BUTTONS.get(key)
+    if not bit:
+        return False
+    return bool(gamepad_buttons_mask() & bit)
+
+
+def _input_loop():
+    """全局热键 + 手柄边沿触发；视觉关闭时停轮询。"""
+    prev_hk = False
+    prev_pad = False
+    parsed = parse_hotkey('Ctrl+Alt+V')
+    last_spec = ''
+    while not _stop.is_set():
+        try:
+            cfg = _load_config()
+            if not cfg.get('vision_enabled'):
+                prev_hk = False
+                prev_pad = False
+                _stop.wait(1.0)
+                continue
+            spec = str(cfg.get('vision_hotkey') or 'Ctrl+Alt+V').strip() or 'Ctrl+Alt+V'
+            if spec != last_spec:
+                parsed = parse_hotkey(spec)
+                last_spec = spec
+                prev_hk = False
+            down = hotkey_is_down(parsed)
+            if down and not prev_hk:
+                threading.Thread(target=force_look_and_speak, daemon=True).start()
+            prev_hk = down
+
+            btn = str(cfg.get('vision_gamepad_button') or '').strip()
+            if btn and btn.upper() not in ('NONE', 'OFF', '无', '禁用', ''):
+                pad = gamepad_button_down(btn)
+                if pad and not prev_pad:
+                    threading.Thread(target=force_look_and_speak, daemon=True).start()
+                prev_pad = pad
+            else:
+                prev_pad = False
+            _stop.wait(0.07)
+        except Exception:
+            _stop.wait(1.0)
+
+
 def _capture_loop(interval: float):
     while not _stop.is_set():
         cfg = _load_config()
@@ -320,7 +693,8 @@ def _capture_loop(interval: float):
             _stop.wait(2.0)
             continue
         interval = max(0.4, float(cfg.get('vision_interval_sec', 30) or 30))
-        jpeg = capture_jpeg()
+        bbox = resolve_capture_bbox(cfg)
+        jpeg = capture_jpeg(bbox=bbox)
         if jpeg:
             fp = fingerprint(jpeg)
             with _latest_lock:
@@ -351,7 +725,6 @@ def _analyze_loop():
                 _stop.wait(0.3)
                 continue
             if fp == last_fp and last_ok_state:
-                # 同画面：只刷新时间戳，不刷 API、不刷麦
                 refreshed = dict(last_ok_state)
                 refreshed['ts'] = time.time()
                 write_screen_state(**{k: refreshed[k] for k in (
@@ -359,7 +732,6 @@ def _analyze_loop():
                 )})
                 _stop.wait(min(2.0, max(0.8, interval * 0.25)))
                 continue
-            # 视频等场景指纹会抖：眼睛 API 仍按间隔节流，始终只看最新槽
             now = time.time()
             if now - last_eyes_at < interval:
                 _stop.wait(0.4)
@@ -375,7 +747,7 @@ def _analyze_loop():
                     event_id='',
                     worthy=False,
                 )
-                last_fp = fp  # 避免失败风暴里每帧重打 API；画面指纹变了才会再试
+                last_fp = fp
                 _stop.wait(1.0)
                 continue
             event_id = hashlib.md5(
@@ -390,7 +762,6 @@ def _analyze_loop():
                 event_id=event_id,
                 worthy=bool(eyes.get('worthy')),
             )
-            # 附带字段写一次完整文件
             state.update({
                 'scene': eyes.get('scene') or '',
                 'focus': eyes.get('focus') or '',
@@ -425,14 +796,13 @@ def run():
     cfg = _load_config()
     if not cfg.get('vision_enabled'):
         write_screen_state(ok=False, summary='视觉已关闭', detail='vision_enabled=false')
-        # 仍保持进程：轮询开关，便于菜单启停共用一个常驻进程；若由壳按开关拉起也可
     try:
         threading.Thread(target=_capture_loop, args=(float(cfg.get('vision_interval_sec', 30) or 30),), daemon=True).start()
         threading.Thread(target=_analyze_loop, daemon=True).start()
+        threading.Thread(target=_input_loop, daemon=True).start()
         while not _stop.is_set():
             cfg = _load_config()
             if not cfg.get('vision_enabled'):
-                # 关视觉：清空槽，空转
                 with _latest_lock:
                     _latest['jpeg'] = None
                     _latest['fp'] = ''
@@ -475,7 +845,6 @@ if __name__ == '__main__':
     try:
         run()
     except Exception:
-        # 绝对不把堆栈甩到无人看的 pythonw 控制台以外；写状态即可
         try:
             write_screen_state(ok=False, summary='视觉启动失败', detail='startup')
         except Exception:

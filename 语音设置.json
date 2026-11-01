@@ -36,5 +36,9 @@
   "vision_model": "qwen3-vl-plus",
   "vision_provider": "阿里百炼",
   "vision_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-  "vision_hotkey": "Ctrl+Alt+V"
+  "vision_hotkey": "Ctrl+Alt+V",
+  "vision_gamepad_button": "",
+  "vision_monitor": "primary",
+  "vision_capture_mode": "monitor",
+  "vision_region": null
 }
