@@ -256,24 +256,34 @@ $captionTimer.Add_Tick({
     $bubble.Visibility = if ($value) { 'Visible' } else { 'Collapsed' }
 })
 $script:ttsProcess = $null
-$ttsListener = Get-NetTCPConnection -LocalPort 9880 -State Listen -ErrorAction SilentlyContinue
-if (-not $ttsListener) {
-    try {
-        $ttsRoot = 'E:\ai\dshzbj'
-        $ttsPython = Join-Path $ttsRoot 'rvc-python\Scripts\python.exe'
-        $ttsApi = Join-Path $ttsRoot 'gpt-sovits\api_v2.py'
-        $ttsConfig = Join-Path $ttsRoot 'runtime\paimon-tts.yaml'
-        foreach ($required in @($ttsPython,$ttsApi,$ttsConfig)) {
-            if (-not (Test-Path -LiteralPath $required)) { throw "缺少本地朗读服务文件：$required" }
+# 百炼/云端 TTS 时不拉本地 SoVITS：听环(vad)与 TTS 提供商解耦；本地音色才需要 9880。
+$needLocalTts = $false
+try {
+    if (Test-Path -LiteralPath $speechConfigFile) {
+        $bootSpeech = Get-Content -LiteralPath $speechConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $needLocalTts = [string]$bootSpeech.tts_provider -like '本地*'
+    }
+} catch { $needLocalTts = $false }
+if ($needLocalTts) {
+    $ttsListener = Get-NetTCPConnection -LocalPort 9880 -State Listen -ErrorAction SilentlyContinue
+    if (-not $ttsListener) {
+        try {
+            $ttsRoot = 'E:\ai\dshzbj'
+            $ttsPython = Join-Path $ttsRoot 'rvc-python\Scripts\python.exe'
+            $ttsApi = Join-Path $ttsRoot 'gpt-sovits\api_v2.py'
+            $ttsConfig = Join-Path $ttsRoot 'runtime\paimon-tts.yaml'
+            foreach ($required in @($ttsPython,$ttsApi,$ttsConfig)) {
+                if (-not (Test-Path -LiteralPath $required)) { throw "缺少本地朗读服务文件：$required" }
+            }
+            $script:ttsProcess = Start-Process -FilePath $ttsPython -ArgumentList @(
+                '-X','utf8',('"' + $ttsApi + '"'),
+                '-a','127.0.0.1','-p','9880','-c',('"' + $ttsConfig + '"')
+            ) -WorkingDirectory (Join-Path $ttsRoot 'gpt-sovits') -WindowStyle Hidden -PassThru `
+                -RedirectStandardOutput (Join-Path $root 'runtime\pet-tts-out.log') `
+                -RedirectStandardError (Join-Path $root 'runtime\pet-tts-err.log')
+        } catch {
+            [Windows.MessageBox]::Show($_.Exception.Message,'本地朗读服务启动失败') | Out-Null
         }
-        $script:ttsProcess = Start-Process -FilePath $ttsPython -ArgumentList @(
-            '-X','utf8',('"' + $ttsApi + '"'),
-            '-a','127.0.0.1','-p','9880','-c',('"' + $ttsConfig + '"')
-        ) -WorkingDirectory (Join-Path $ttsRoot 'gpt-sovits') -WindowStyle Hidden -PassThru `
-            -RedirectStandardOutput (Join-Path $root 'runtime\pet-tts-out.log') `
-            -RedirectStandardError (Join-Path $root 'runtime\pet-tts-err.log')
-    } catch {
-        [Windows.MessageBox]::Show($_.Exception.Message,'本地朗读服务启动失败') | Out-Null
     }
 }
 $window.Add_Closed({
@@ -292,8 +302,13 @@ $window.Add_Closed({
         }
         Get-CimInstance Win32_Process | Where-Object {
             $_.Name -in @('python.exe','pythonw.exe') -and
-            ($_.CommandLine -like ('*"' + (Join-Path $root '语音设置.py') + '"*') -or $_.CommandLine -like ('*"' + (Join-Path $root '语音链路.py') + '"*') -or $_.CommandLine -like ('*"' + (Join-Path $root '屏幕视觉.py') + '"*'))
+            ($_.CommandLine -like ('*"' + (Join-Path $root '语音设置.py') + '"*') -or $_.CommandLine -like ('*"' + (Join-Path $root '语音链路.py') + '"*') -or $_.CommandLine -like ('*"' + (Join-Path $root '屏幕视觉.py') + '"*') -or $_.CommandLine -match 'asr_server\.py' -or $_.CommandLine -match 'gpt-sovits\\api_v2\.py' -or $_.CommandLine -match 'gpt-sovits/api_v2\.py')
         } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        # 退出桌宠时一并停本地 ASR 常驻（饭耳托盘仍在，需要时可再点启动）
+        $stopAsr = 'C:\asr\stop_asr.ps1'
+        if (Test-Path -LiteralPath $stopAsr) {
+            Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$stopAsr) -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+        }
     } catch {}
 })
 $timer.Start()
