@@ -4,6 +4,84 @@ $root = $PSScriptRoot
 $framesRoot = Join-Path $root '桌宠帧'
 $idle = @('idle_v2','idle_read_v2','idle_fish_v1','eat_rice_v1','eat_spin_v1_loop_preview')
 
+
+$runtimeDir = Join-Path $root 'runtime'
+New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+$script:childPidFile = Join-Path $runtimeDir 'whale-children.json'
+$script:petPidFile = Join-Path $runtimeDir 'pet.pid'
+$script:childPids = [System.Collections.Generic.List[int]]::new()
+try { [IO.File]::WriteAllText($script:petPidFile, [string]$PID, [Text.UTF8Encoding]::new($false)) } catch {}
+
+function Register-WhaleChild([int]$ProcessId) {
+    if ($ProcessId -le 0) { return }
+    if (-not $script:childPids.Contains($ProcessId)) { [void]$script:childPids.Add($ProcessId) }
+    try {
+        $script:childPids | ConvertTo-Json -Compress | Set-Content -LiteralPath $script:childPidFile -Encoding UTF8
+    } catch {}
+}
+
+function Stop-WhaleChildren {
+    # 1) 登记过的子 PID
+    foreach ($id in @($script:childPids)) {
+        try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    try {
+        if (Test-Path -LiteralPath $script:childPidFile) {
+            $saved = Get-Content -LiteralPath $script:childPidFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+            foreach ($id in @($saved)) {
+                try { Stop-Process -Id ([int]$id) -Force -ErrorAction SilentlyContinue } catch {}
+            }
+        }
+    } catch {}
+    # 2) settings.pid
+    try {
+        $sp = Join-Path $runtimeDir 'settings.pid'
+        if (Test-Path -LiteralPath $sp) {
+            $sid = 0
+            if ([int]::TryParse((Get-Content -LiteralPath $sp -Raw).Trim(), [ref]$sid) -and $sid -gt 0) {
+                Stop-Process -Id $sid -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {}
+    # 3) 按命令行匹配 E:\小鲸鱼 相关脚本（不含 Aura/Screen_intf）
+    $markers = @('语音设置.py','语音链路.py','屏幕视觉.py','小金鱼','捉虫')
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -in @('python.exe','pythonw.exe') -and $_.CommandLine -and (
+            ($_.CommandLine -like ('*' + $root + '*') -and (
+                ($_.CommandLine -like '*语音设置.py*') -or
+                ($_.CommandLine -like '*语音链路.py*') -or
+                ($_.CommandLine -like '*屏幕视觉.py*') -or
+                ($_.CommandLine -like '*小金鱼*') -or
+                ($_.CommandLine -like '*捉虫*')
+            )) -or
+            ($_.CommandLine -match 'asr_server\.py') -or
+            ($_.CommandLine -match 'gpt-sovits[\\/]+api_v2\.py')
+        )
+    } | ForEach-Object {
+        try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    try {
+        if (Test-Path -LiteralPath $script:petPidFile) { Remove-Item -LiteralPath $script:petPidFile -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath (Join-Path $runtimeDir 'settings.pid')) { Remove-Item -LiteralPath (Join-Path $runtimeDir 'settings.pid') -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $script:childPidFile) { Remove-Item -LiteralPath $script:childPidFile -Force -ErrorAction SilentlyContinue }
+    } catch {}
+}
+
+function Start-WhalePython([string]$ScriptName, [switch]$AllowFocusRelaunch) {
+    $scriptPath = Join-Path $root $ScriptName
+    $existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -in @('python.exe','pythonw.exe') -and $_.CommandLine -like ('*"' + $scriptPath + '"*')
+    }
+    # 设置窗：允许再拉起一次，由 Python mutex 聚焦旧窗后立刻退出
+    if ($existing -and -not $AllowFocusRelaunch) { return $null }
+    $proc = Start-Process -FilePath 'C:\ProgramData\miniconda3\pythonw.exe' -ArgumentList ('"' + $scriptPath + '"') -WorkingDirectory $root -PassThru
+    if ($proc -and -not $AllowFocusRelaunch) { Register-WhaleChild $proc.Id }
+    elseif ($proc -and -not $existing) { Register-WhaleChild $proc.Id }
+    return $proc
+}
+
+
+
 function Get-Frames([string]$name) {
     $path = Join-Path $framesRoot $name
     $files = @(Get-ChildItem -LiteralPath $path -Filter '*.png' -File | Sort-Object Name | ForEach-Object FullName)
@@ -14,39 +92,6 @@ if ($Check) {
     foreach ($name in $idle + @('speak_v1')) { "$name : $((Get-Frames $name).Count) 帧" }
     exit 0
 }
-# 单实例：已有桌宠则前置旧窗并退出，避免多开空转吃满 CPU
-Add-Type -Namespace WhalePet -Name Native -MemberDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class Native {
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-}
-"@
-$script:petMutex = New-Object System.Threading.Mutex($false, 'Global\XiaojingyuDesktopPet')
-if (-not $script:petMutex.WaitOne(0)) {
-    $found = [IntPtr]::Zero
-    $callback = [WhalePet.Native+EnumWindowsProc]{
-        param([IntPtr]$h, [IntPtr]$l)
-        if (-not [WhalePet.Native]::IsWindowVisible($h)) { return $true }
-        $sb = New-Object System.Text.StringBuilder 256
-        [void][WhalePet.Native]::GetWindowText($h, $sb, 256)
-        if ($sb.ToString() -eq '桌宠') { $script:foundHwnd = $h; return $false }
-        return $true
-    }
-    $script:foundHwnd = [IntPtr]::Zero
-    [WhalePet.Native]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
-    if ($script:foundHwnd -ne [IntPtr]::Zero) {
-        [WhalePet.Native]::ShowWindow($script:foundHwnd, 9) | Out-Null
-        [WhalePet.Native]::SetForegroundWindow($script:foundHwnd) | Out-Null
-    }
-    exit 0
-}
-
 Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
 $window = New-Object Windows.Window
 $window.Title = '桌宠'
@@ -111,7 +156,7 @@ $listen.Add_Click({
         [IO.File]::WriteAllText($speechConfigFile,($speechConfig | ConvertTo-Json -Depth 10),[Text.UTF8Encoding]::new($false))
         if ($listen.IsChecked) {
             if (-not $speechConfig.conversation_id) { throw '请先在语音设置中选择 DSH 对话并保存。' }
-            Start-Process -FilePath 'C:\ProgramData\miniconda3\pythonw.exe' -ArgumentList ('"' + (Join-Path $root '语音链路.py') + '"') -WorkingDirectory $root
+            Start-WhalePython '语音链路.py' | Out-Null
         }
     } catch {
         $listen.IsChecked = -not $listen.IsChecked
@@ -122,7 +167,7 @@ $listen.Add_Click({
 })
 $menu.Items.Add($listen) | Out-Null
 if ($listen.IsChecked -and $speechConfig.conversation_id) {
-    Start-Process -FilePath 'C:\ProgramData\miniconda3\pythonw.exe' -ArgumentList ('"' + (Join-Path $root '语音链路.py') + '"') -WorkingDirectory $root
+    Start-WhalePython '语音链路.py' | Out-Null
 }
 $vision = New-Object Windows.Controls.MenuItem
 $vision.Header = '屏幕视觉'
@@ -133,12 +178,7 @@ if (Test-Path -LiteralPath $speechConfigFile) {
     $vision.IsChecked = [bool]$speechConfig.vision_enabled
 }
 function Start-WhaleVision {
-    $existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -in @('python.exe','pythonw.exe') -and $_.CommandLine -like ('*"' + (Join-Path $root '屏幕视觉.py') + '"*')
-    }
-    if (-not $existing) {
-        Start-Process -FilePath 'C:\ProgramData\miniconda3\pythonw.exe' -ArgumentList ('"' + (Join-Path $root '屏幕视觉.py') + '"') -WorkingDirectory $root
-    }
+    Start-WhalePython '屏幕视觉.py' | Out-Null
 }
 function Stop-WhaleVision {
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
@@ -166,7 +206,8 @@ $audioSettings = New-Object Windows.Controls.MenuItem
 
 $audioSettings.Header = '⚙   语音与对话设置'
 $audioSettings.Add_Click({
-    Start-Process -FilePath 'C:\ProgramData\miniconda3\pythonw.exe' -ArgumentList ('"' + (Join-Path $root '语音设置.py') + '"') -WorkingDirectory $root
+    # 附属主壳：PassThru 登记 PID；设置进程自身 mutex 防多开
+    Start-WhalePython '语音设置.py' -AllowFocusRelaunch | Out-Null
 })
 $menu.Items.Add($audioSettings) | Out-Null
 $speak = New-Object Windows.Controls.MenuItem
@@ -314,6 +355,7 @@ if ($needLocalTts) {
             ) -WorkingDirectory (Join-Path $ttsRoot 'gpt-sovits') -WindowStyle Hidden -PassThru `
                 -RedirectStandardOutput (Join-Path $root 'runtime\pet-tts-out.log') `
                 -RedirectStandardError (Join-Path $root 'runtime\pet-tts-err.log')
+            if ($script:ttsProcess) { Register-WhaleChild $script:ttsProcess.Id }
         } catch {
             [Windows.MessageBox]::Show($_.Exception.Message,'本地朗读服务启动失败') | Out-Null
         }
@@ -321,7 +363,6 @@ if ($needLocalTts) {
 }
 $window.Add_Closed({
     $timer.Stop(); $captionTimer.Stop()
-    try { if ($script:petMutex) { $script:petMutex.ReleaseMutex(); $script:petMutex.Dispose() } } catch {}
     try {
         if ($script:ttsProcess -and -not $script:ttsProcess.HasExited) {
             Stop-Process -Id $script:ttsProcess.Id -Force -ErrorAction SilentlyContinue
@@ -334,11 +375,8 @@ $window.Add_Closed({
             $closingConfig | Add-Member -NotePropertyName vision_enabled -NotePropertyValue $false -Force
             [IO.File]::WriteAllText($speechConfigFile,($closingConfig | ConvertTo-Json -Depth 10),[Text.UTF8Encoding]::new($false))
         }
-        Get-CimInstance Win32_Process | Where-Object {
-            $_.Name -in @('python.exe','pythonw.exe') -and
-            ($_.CommandLine -like ('*"' + (Join-Path $root '语音设置.py') + '"*') -or $_.CommandLine -like ('*"' + (Join-Path $root '语音链路.py') + '"*') -or $_.CommandLine -like ('*"' + (Join-Path $root '屏幕视觉.py') + '"*') -or $_.CommandLine -match 'asr_server\.py' -or $_.CommandLine -match 'gpt-sovits\\api_v2\.py' -or $_.CommandLine -match 'gpt-sovits/api_v2\.py')
-        } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        # 退出桌宠时一并停本地 ASR 常驻（饭耳托盘仍在，需要时可再点启动）
+        # 退出杀干净：登记 PID + 命令行匹配听环/视觉/设置/本地 TTS（不碰 Aura/Screen_intf）
+        Stop-WhaleChildren
         $stopAsr = 'C:\asr\stop_asr.ps1'
         if (Test-Path -LiteralPath $stopAsr) {
             Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$stopAsr) -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue

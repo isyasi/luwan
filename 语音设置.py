@@ -1,5 +1,7 @@
 """桌宠语音设置；密钥通过环境变量提供，不写入设置文件。"""
 import json
+import os
+import time
 import ctypes
 from pathlib import Path
 import tkinter as tk
@@ -8,9 +10,17 @@ import sounddevice as sd
 from 语音预设 import PRESETS, discover
 from 语音链路 import VOICES, record, transcribe, synthesize, play, send
 from 麦克风波纹 import MicrophoneMeter
+from 单实例 import (
+    try_acquire,
+    MUTEX_VOICE_SETTINGS,
+    PORT_VOICE_SETTINGS,
+)
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / '语音设置.json'
+RUNTIME = ROOT / 'runtime'
+SETTINGS_PID = RUNTIME / 'settings.pid'
+PET_PID = RUNTIME / 'pet.pid'
 
 def _focus_existing_settings():
     """已有设置窗则前置并退出；用窗口标题匹配。"""
@@ -46,17 +56,19 @@ def main():
             ctypes.windll.user32.SetProcessDPIAware()
         except (AttributeError, OSError):
             pass
-    # 单实例：端口锁；已开则聚焦旧窗并退出，避免多窗空转吃 CPU。
-    import socket
-    _settings_lock = socket.socket()
-    try:
-        _settings_lock.bind(('127.0.0.1', 19391))
-    except OSError:
+    # 单实例：命名 Mutex Local\XiaoJingYu_VoiceSettings + 端口 19391；已开则聚焦旧窗并退出。
+    _settings_lock = try_acquire(MUTEX_VOICE_SETTINGS, PORT_VOICE_SETTINGS)
+    if _settings_lock is None:
         try:
             _focus_existing_settings()
         except Exception:
             pass
         return
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PID.write_text(str(os.getpid()), encoding='utf-8')
+    except OSError:
+        pass
     config = json.loads(CONFIG.read_text(encoding='utf-8')) if CONFIG.exists() else {}
     app = tk.Tk()
     dpi = app.winfo_fpixels('1i')
@@ -120,8 +132,8 @@ def main():
             fields[key].set('系统默认')
         if key == 'microphone':
             meter = MicrophoneMeter(app, device_box.master, fields[key], ui_scale)
-            device_box.bind('<<ComboboxSelected>>', lambda event: meter.start())
-            app.after(250, meter.start)
+            device_box.bind('<<ComboboxSelected>>', lambda event: (meter.set_active(True), meter.start()))
+            app.after(250, lambda: meter.set_active(True))
     interrupt_frame = ttk.LabelFrame(left, text='开口打断 · 音量门槛', padding=8)
     interrupt_frame.pack(fill='x', padx=6, pady=6)
     interrupt_db = tk.DoubleVar(value=max(-60., min(-10., float(config.get('interrupt_db', -30)))))
@@ -333,7 +345,9 @@ def main():
         style='Subtitle.TLabel',
         wraplength=int(460 * ui_scale),
     ).pack(anchor='w', pady=(2, 0))
-    after_ids = {'vision': None, 'listener': None, 'parent': None}
+    after_ids = {'vision': None, 'listener': None, 'idle': None, 'parent': None}
+    meter_active = [True]
+    last_input = [time.time()]
     def _cancel_afters():
         for key, aid in list(after_ids.items()):
             if aid is not None:
@@ -342,6 +356,65 @@ def main():
                 except Exception:
                     pass
                 after_ids[key] = None
+    def _mark_activity(event=None):
+        last_input[0] = time.time()
+        if not meter_active[0]:
+            meter_active[0] = True
+            try:
+                meter.set_active(True)
+            except Exception:
+                pass
+    def _sync_idle():
+        try:
+            if not app.winfo_exists():
+                return
+            try:
+                focused = bool(app.focus_displayof())
+            except Exception:
+                focused = False
+            idle_for = time.time() - last_input[0]
+            # 失焦或 6 秒无操作：停 MicrophoneMeter 流与绘制
+            want = bool(focused) and idle_for < 6.0
+            if want != meter_active[0]:
+                meter_active[0] = want
+                try:
+                    meter.set_active(want)
+                except Exception:
+                    pass
+            after_ids['idle'] = app.after(800 if want else 2000, _sync_idle)
+        except tk.TclError:
+            return
+    def _shell_alive():
+        """设置窗附属主壳：runtime/pet.pid 对应进程不在则自行退出。"""
+        try:
+            if not PET_PID.exists():
+                return False
+            pid = int(PET_PID.read_text(encoding='utf-8').strip() or '0')
+            if pid <= 0:
+                return False
+            # Windows: OpenProcess + GetExitCodeProcess；失败则当存活以免误关
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            code = ctypes.c_ulong()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            kernel32.CloseHandle(handle)
+            # STILL_ACTIVE = 259
+            return bool(ok) and code.value == 259
+        except Exception:
+            return True
+    def _watch_parent():
+        try:
+            if not app.winfo_exists():
+                return
+            if not _shell_alive():
+                on_close()
+                return
+            after_ids['parent'] = app.after(3000, _watch_parent)
+        except tk.TclError:
+            return
     def poll_vision_status():
         try:
             if not app.winfo_exists():
@@ -356,12 +429,12 @@ def main():
                     vision_status.set('看到：' + str(info.get('summary') or '').replace('\n', ' ')[:80])
                 else:
                     vision_status.set('视觉待命/失败：' + str(info.get('summary') or 'ok=false')[:60])
-                # 开视觉时：失焦降到 5s，聚焦 2s
+                # 开视觉时：失焦/空闲大幅降频
                 try:
                     focused = bool(app.focus_displayof())
                 except Exception:
                     focused = True
-                delay = 2000 if focused else 5000
+                delay = 2500 if focused else 10000
             else:
                 vision_status.set('尚未产生 screen_state（请用右键菜单打开屏幕视觉）。')
                 delay = 5000
@@ -436,7 +509,8 @@ def main():
                 def finished():
                     for b in buttons:
                         b.configure(state='normal')
-                    meter.start()
+                    if meter_active[0]:
+                        meter.set_active(True)
                 app.after(0, finished)
         threading.Thread(target=worker, daemon=True).start()
     record_actions = ttk.Frame(right)
@@ -449,8 +523,6 @@ def main():
     feedback.pack(fill='x')
     ttk.Label(feedback, textvariable=result, style='Subtitle.TLabel', width=28, anchor='w').pack(fill='x')
     ttk.Label(feedback, textvariable=recognized_text, width=28, anchor='w').pack(fill='x', pady=(4, 0))
-
-
     last_listener_update = [0]
     def poll_listener():
         try:
@@ -470,13 +542,18 @@ def main():
                 focused = bool(app.focus_displayof())
             except Exception:
                 focused = True
-            delay = 1500 if focused else 5000
+            delay = 2000 if focused else 10000
         except (OSError, ValueError):
-            delay = 5000
+            delay = 8000
         except tk.TclError:
             return
         after_ids['listener'] = app.after(delay, poll_listener)
     poll_listener()
+    for _seq in ('<Any-KeyPress>', '<Any-ButtonPress>', '<Motion>', '<MouseWheel>'):
+        app.bind_all(_seq, _mark_activity, add='+')
+    app.bind('<FocusIn>', _mark_activity, add='+')
+    app.bind('<FocusOut>', lambda e: app.after(200, _sync_idle), add='+')
+    _sync_idle()
     voice_mount = ttk.LabelFrame(right_column, text='音色设置与试听', padding=4)
     voice_mount.pack(fill='both', expand=True)
     voice_refresh[0] = open_voice_settings
@@ -549,6 +626,7 @@ def main():
     def on_close():
         _cancel_afters()
         try:
+            meter.set_active(False)
             meter.stop()
         except Exception:
             pass
@@ -556,61 +634,25 @@ def main():
             meter.closed = True
             if getattr(meter, 'timer', None):
                 app.after_cancel(meter.timer)
+                meter.timer = None
         except Exception:
             pass
         try:
-            _settings_lock.close()
+            if SETTINGS_PID.exists() and SETTINGS_PID.read_text(encoding='utf-8').strip() == str(os.getpid()):
+                SETTINGS_PID.unlink()
+        except OSError:
+            pass
+        try:
+            if _settings_lock is not None:
+                _settings_lock.release()
         except Exception:
             pass
-        app.destroy()
-
-    def _pet_shell_alive():
-        """桌宠主窗是否还在（标题=桌宠）。"""
-        user32 = ctypes.windll.user32
-        found = ctypes.c_bool(False)
-        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-        def enum_proc(hwnd, _lparam):
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            buf = ctypes.create_unicode_buffer(256)
-            user32.GetWindowTextW(hwnd, buf, 256)
-            if buf.value == '桌宠':
-                found.value = True
-                return False
-            return True
-        user32.EnumWindows(enum_proc, 0)
-        return bool(found.value)
-
-    def poll_parent_alive():
-        """主壳退出则关掉设置窗；失焦停麦指示，聚焦再开。"""
         try:
-            if not app.winfo_exists():
-                return
-            if not _pet_shell_alive():
-                on_close()
-                return
-            try:
-                focused = bool(app.focus_displayof())
-            except Exception:
-                focused = False
-            try:
-                if focused:
-                    if meter.stream is None and not meter.closed:
-                        meter.start()
-                else:
-                    if meter.stream is not None:
-                        meter.stop()
-            except Exception:
-                pass
-            after_ids['parent'] = app.after(3000 if focused else 5000, poll_parent_alive)
-        except tk.TclError:
-            return
+            app.destroy()
         except Exception:
-            after_ids['parent'] = app.after(8000, poll_parent_alive)
-
-    after_ids.setdefault('parent', None)
-    poll_parent_alive()
+            pass
     app.protocol('WM_DELETE_WINDOW', on_close)
+    _watch_parent()
     app.mainloop()
 
 if __name__ == '__main__':

@@ -38,19 +38,43 @@ function Start-Pet {
     } catch {}
 }
 
-# 关闭桌宠：结束桌宠进程，并顺带结束它拉起的语音链路 python
+# 关闭桌宠：结束桌宠进程，并杀干净由其拉起的听环/视觉/设置/本地 TTS（不碰 Aura）
 function Stop-Pet {
     $pet = Get-PetProcess
     if ($pet) {
         Stop-Process -Id $pet.ProcessId -Force
     }
-    # 结束语音链路 / 语音设置 的 python 进程
+    $runtimeDir = Join-Path $root 'runtime'
+    foreach ($name in @('settings.pid','pet.pid','whale-children.json')) {
+        $fp = Join-Path $runtimeDir $name
+        if ($name -eq 'whale-children.json' -and (Test-Path -LiteralPath $fp)) {
+            try {
+                $ids = Get-Content -LiteralPath $fp -Raw | ConvertFrom-Json
+                foreach ($id in @($ids)) { Stop-Process -Id ([int]$id) -Force -ErrorAction SilentlyContinue }
+            } catch {}
+        } elseif ((Test-Path -LiteralPath $fp) -and $name -like '*.pid') {
+            try {
+                $sid = 0
+                if ([int]::TryParse((Get-Content -LiteralPath $fp -Raw).Trim(), [ref]$sid) -and $sid -gt 0) {
+                    Stop-Process -Id $sid -Force -ErrorAction SilentlyContinue
+                }
+            } catch {}
+        }
+    }
     $pyProcs = Get-CimInstance Win32_Process | Where-Object {
-        ($_.Name -in @('python.exe','pythonw.exe')) -and
-        ($_.CommandLine -like '*语音链路.py*' -or $_.CommandLine -like '*语音设置.py*')
+        ($_.Name -in @('python.exe','pythonw.exe')) -and $_.CommandLine -and (
+            ($_.CommandLine -like ('*' + $root + '*') -and (
+                $_.CommandLine -like '*语音链路.py*' -or
+                $_.CommandLine -like '*语音设置.py*' -or
+                $_.CommandLine -like '*屏幕视觉.py*' -or
+                $_.CommandLine -like '*小金鱼*' -or
+                $_.CommandLine -like '*捉虫*'
+            )) -or
+            ($_.CommandLine -match 'gpt-sovits[\/]+api_v2\.py')
+        )
     }
     foreach ($p in $pyProcs) {
-        Stop-Process -Id $p.ProcessId -Force
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
     }
 }
 

@@ -11,6 +11,7 @@ import io
 import json
 import os
 import socket
+from 单实例 import try_acquire, MUTEX_SCREEN_VISION, PORT_SCREEN_VISION
 import threading
 import time
 import traceback
@@ -788,10 +789,9 @@ def _analyze_loop():
 
 
 def run():
-    lock = socket.socket()
-    try:
-        lock.bind(('127.0.0.1', VISION_LOCK_PORT))
-    except OSError:
+    # 单实例：Mutex Local\XiaoJingYu_ScreenVision + 端口 19390
+    lock = try_acquire(MUTEX_SCREEN_VISION, PORT_SCREEN_VISION)
+    if lock is None:
         return False
     cfg = _load_config()
     if not cfg.get('vision_enabled'):
@@ -814,8 +814,8 @@ def run():
     finally:
         _stop.set()
         try:
-            lock.close()
-        except OSError:
+            lock.release()
+        except Exception:
             pass
     return True
 

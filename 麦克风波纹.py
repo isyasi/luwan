@@ -20,6 +20,7 @@ class MicrophoneMeter:
         self.analysis_thread = None
         self.level = 0.0
         self.closed = False
+        self.active = True  # False=空闲/失焦：停流+停画，降 CPU
         self.timer = None
         self.scale = scale
         self.canvas = tk.Canvas(parent, width=int(126*scale), height=int(25*scale), bg='#F3F8FC', highlightthickness=0)
@@ -35,9 +36,41 @@ class MicrophoneMeter:
         except queue.Full:
             pass
 
+    def set_active(self, active):
+        """聚焦/操作时 True；失焦或久无操作时 False，彻底停麦克风流与 after 绘制。"""
+        active = bool(active)
+        if self.closed:
+            return
+        if active == self.active and (bool(self.stream) == active or not active):
+            # 已是目标态；若要激活但流没了则继续往下拉起
+            if not active or self.stream is not None:
+                self.active = active
+                return
+        self.active = active
+        if active:
+            self.start()
+            if not self.timer:
+                self.draw()
+        else:
+            if self.timer:
+                try:
+                    self.app.after_cancel(self.timer)
+                except Exception:
+                    pass
+                self.timer = None
+            self.stop()
+            try:
+                self.canvas.delete('all')
+                for i in range(12):
+                    x, y = (3 + i * 6) * self.scale, 12.5 * self.scale
+                    self.canvas.create_line(x, y - self.scale, x, y + self.scale, fill='#A6B7C2', width=max(2, 2 * self.scale), capstyle='round')
+                self.canvas.create_text(100 * self.scale, 12.5 * self.scale, text='暂停', fill='#91A4B0', font=('Microsoft YaHei UI', 9))
+            except Exception:
+                pass
+
     def start(self):
         self.stop()
-        if self.closed:
+        if self.closed or not self.active:
             return
         value = self.value.get()
         index = None if value == '系统默认' else int(value.split(':', 1)[0])
@@ -70,7 +103,8 @@ class MicrophoneMeter:
             self.samples.get_nowait()
 
     def draw(self):
-        if self.closed:
+        if self.closed or not self.active:
+            self.timer = None
             return
         raw = self.raw
         # ponytail: RMS 只显示声音强弱；是否为人声仍由监听链路的 Silero 判断。
@@ -84,13 +118,9 @@ class MicrophoneMeter:
             height = (2 + 20*self.level*weight) * self.scale
             x, y = (3+i*6)*self.scale, 12.5*self.scale
             self.canvas.create_line(x, y-height/2, x, y+height/2, fill='#328EAC' if self.stream else '#A6B7C2', width=max(2, 2*self.scale), capstyle='round')
-        if self.stream is None:
-            tick = 800
-        elif self.level < 0.04:
-            tick = 400
-        else:
-            tick = 120
-        self.timer = self.app.after(tick, self.draw)
+        # 有声 150ms；近静音 400ms，进一步降空闲绘制频率
+        delay = 150 if self.level > 0.05 else 400
+        self.timer = self.app.after(delay, self.draw)
 
     def analyze(self, rate, stop):
         try:

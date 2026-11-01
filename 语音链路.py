@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import socket
+from 单实例 import try_acquire, MUTEX_VOICE_LOOP, PORT_VOICE_LOOP
 import time
 import wave
 from pathlib import Path
@@ -380,11 +381,9 @@ def wait_reply(session_id, previous, cancel=None):
     return ''
 
 def listen():
-    # ponytail: 单实例使用本机端口锁；多个桌宠实例需独立分配端口。
-    lock = socket.socket()
-    try:
-        lock.bind(('127.0.0.1', 19389))
-    except OSError:
+    # 单实例：Mutex Local\XiaoJingYu_VoiceLoop + 端口 19389
+    lock = try_acquire(MUTEX_VOICE_LOOP, PORT_VOICE_LOOP)
+    if lock is None:
         return False
     import onnxruntime as ort
     model = Path.home() / '.dsh/local-plugins/dsh-voice-loop/models/silero_vad.onnx'
@@ -397,7 +396,7 @@ def listen():
         ready = session.get(voice_endpoint(base) + '/status', timeout=5)
     if ready.status_code != 200:
         state('DSH 发送插件未加载，请重启 DSH。麦克风尚未开启。')
-        lock.close()
+        lock.release()
         return
     index = device(config.get('microphone'))
     rate = int(sd.query_devices(index, 'input')['default_samplerate'])
@@ -527,7 +526,7 @@ def listen():
     finally:
         stopped.set()
         current_cancel[0].set()
-        lock.close()
+        lock.release()
 
 if __name__ == '__main__':
     while True:
