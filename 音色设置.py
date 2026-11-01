@@ -39,7 +39,7 @@ def open_dialog(parent, provider, saved, initial_key, on_save, speaker, host=Non
     ttk.Label(panel, text=provider + ' · 模型与音色', style='Subtitle.TLabel').pack(anchor='w', pady=(0, 6))
     values = {}
     widgets = {}
-    defaults = {'model': MODELS[provider][0], 'mode': '系统音色', 'region': '北京', 'workspace': '', 'voice': 'Cherry' if provider == '阿里百炼' else ('冰糖' if provider == '小米 MiMo' else 'Chinese (Mandarin)_Sweet_Girl'), 'name': 'whalevoice', 'reference': '', 'instructions': '', 'preview': '你好，这是小鲸鱼的声音试听，希望今天能给你带来好心情。', 'speed': '1', 'volume': '1', 'pitch': '0', 'emotion': '自动'}
+    defaults = {'model': MODELS[provider][0], 'mode': '系统音色', 'region': '北京', 'workspace': '', 'voice': 'Cherry' if provider == '阿里百炼' else ('冰糖' if provider == '小米 MiMo' else 'Chinese (Mandarin)_Sweet_Girl'), 'name': 'whalevoice', 'reference': '', 'instructions': '', 'preview': '你好，这是小鲸鱼的声音试听，希望今天能给你带来好心情。', 'speed': '1.2', 'volume': '1', 'pitch': '0', 'emotion': '自动'}
     frames = {}
     def row(key, title, choices=None, masked=False):
         frame = ttk.Frame(panel)
@@ -69,6 +69,8 @@ def open_dialog(parent, provider, saved, initial_key, on_save, speaker, host=Non
     ttk.Button(frames['reference'], text='选择', command=lambda: values['reference'].set(filedialog.askopenfilename(parent=window, filetypes=[('参考音频', '*.wav *.mp3')]) or values['reference'].get())).pack(side='right', padx=(6, 0))
     row('instructions', '声音描述 / 风格')
     row('preview', '试听文字')
+    if provider == '阿里百炼':
+        row('speed', '语速', ['1', '1.2', '1.5'])
     if provider == 'MiniMax':
         row('speed', '语速', ['0.5', '0.8', '1', '1.2', '1.5', '2'])
         row('volume', '音量', ['0.5', '1', '1.5', '2'])

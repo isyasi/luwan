@@ -113,6 +113,26 @@ def transcribe(provider, audio, key=''):
         raise ValueError('未识别到文字，请检查麦克风或重新录音')
     return simplified(text.strip())
 
+def apply_playback_speed(audio: bytes, speed: float) -> bytes:
+    """Time-compress/expand WAV/PCM audio without calling streaming TTS. Pitch will shift slightly (resample)."""
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError):
+        return audio
+    if not audio or abs(speed - 1.0) < 0.02:
+        return audio
+    speed = max(0.5, min(2.0, speed))
+    samples, rate = sf.read(io.BytesIO(audio), dtype="float32", always_2d=True)
+    import math
+    from scipy.signal import resample_poly
+    # play faster => fewer samples at same rate
+    up, down = 100, max(1, int(round(100 * speed)))
+    g = math.gcd(up, down)
+    up, down = up // g, down // g
+    samples = resample_poly(samples, up, down)
+    return wav_bytes(samples, rate)
+
+
 def synthesize(provider, text, voice, key='', options=None):
     url, model = PRESETS['tts'][provider]
     if options is None:
@@ -124,9 +144,16 @@ def synthesize(provider, text, voice, key='', options=None):
         if provider.startswith('本地'):
             references = list(Path(r'E:\ai\dshzbj\models\paimon-gpt-sovits-v2').glob('说话-*.wav'))
             if not references:
-                raise ValueError('缺少本地派蒙参考音频')
+                raise ValueError('缺少本地派蒙参考音频（paimon-gpt-sovits-v2）')
             payload = {'text': text, 'text_lang': 'zh', 'media_type': 'wav', 'ref_audio_path': str(references[0]), 'prompt_text': '既然罗莎莉亚说足迹上有元素力，用元素视野应该能很清楚地看到吧。', 'prompt_lang': 'zh', 'streaming_mode': False}
-            r = s.post(url + '/tts', json=payload, timeout=(5, 120))
+            try:
+                r = s.post(url + '/tts', json=payload, timeout=(5, 120))
+            except requests.exceptions.ConnectionError:
+                raise ValueError('本地音色服务连不上（9880）。请只开一个 gpt-sovits，或改用阿里百炼 TTS')
+            except requests.exceptions.Timeout:
+                raise ValueError('本地音色超时（9880）。可改用阿里百炼 TTS')
+            if not r.ok:
+                raise ValueError(f'本地音色失败 HTTP {r.status_code}（请确认只开一个 api_v2）')
             return checked(r).content
         if provider == 'Windows 本地语音':
             import subprocess
@@ -144,12 +171,18 @@ def synthesize(provider, text, voice, key='', options=None):
         if provider == '阿里百炼':
             from 云端音色 import ali_base
             base = ali_base(options)
+            try:
+                speech_rate = float(options.get('speed', 1.2) or 1.2)
+            except (TypeError, ValueError):
+                speech_rate = 1.2
+            speech_rate = max(0.5, min(2.0, speech_rate))
             if model == 'qwen3-tts-flash':
                 url = base + '/services/aigc/multimodal-generation/generation'
-                payload = {'model': model, 'input': {'text': text, 'voice': voice, 'language_type': 'Chinese', 'enable_audio_encoder_output': False}}
+                # 官方非实时文档未列语速；仍写入 speech_rate，若被忽略则下方本地变速兜底
+                payload = {'model': model, 'input': {'text': text, 'voice': voice, 'language_type': 'Chinese', 'enable_audio_encoder_output': False, 'speech_rate': speech_rate}, 'parameters': {'speech_rate': speech_rate}}
             else:
                 url = base + '/services/audio/tts/SpeechSynthesizer'
-                payload = {'model': model, 'input': {'text': text, 'voice': voice, 'format': 'wav', 'sample_rate': 24000}}
+                payload = {'model': model, 'input': {'text': text, 'voice': voice, 'format': 'wav', 'sample_rate': 24000}, 'parameters': {'speech_rate': speech_rate}}
         elif provider == 'MiniMax':
             setting = {'voice_id': voice, 'speed': float(options.get('speed', 1)), 'vol': float(options.get('volume', 1)), 'pitch': int(options.get('pitch', 0))}
             if options.get('emotion') and options['emotion'] != '自动':
@@ -190,12 +223,22 @@ def synthesize(provider, text, voice, key='', options=None):
             parsed = urlparse(audio_url)
         if parsed.scheme != 'https':
             raise ValueError('合成服务返回了不安全的音频地址')
-        return checked(s.get(audio_url, timeout=45)).content
+        audio = checked(s.get(audio_url, timeout=45)).content
+        if provider == '阿里百炼':
+            try:
+                speed = float(options.get('speed', 1.2) or 1.2)
+            except (TypeError, ValueError):
+                speed = 1.2
+            audio = apply_playback_speed(audio, speed)
+        return audio
 
 def play(audio, speaker, cancel=None):
     samples, rate = sf.read(io.BytesIO(audio), dtype='float32', always_2d=True)
-    index = device(speaker)
-    info = sd.query_devices(index, 'output')
+    try:
+        index = device(speaker)
+        info = sd.query_devices(index, 'output')
+    except Exception as err:
+        raise ValueError(f'播放设备不可用（speaker={speaker!r}）：{err}') from err
     target_rate = int(info['default_samplerate'])
     if rate != target_rate:
         from scipy.signal import resample_poly
@@ -294,7 +337,7 @@ def stream_reply(session_id, previous=0, cancel=None):
                 try:
                     r = s.get(url, params={'sessionId': session_id}, timeout=5)
                 except Exception:
-                    time.sleep(.1)
+                    time.sleep(.22)
                     continue
                 if r.status_code in (404, 405):
                     # 桥接插件还是旧版，没有 /reply；回退到磁盘轮询。
@@ -310,7 +353,7 @@ def stream_reply(session_id, previous=0, cancel=None):
                     if text and text == last:
                         yield text, True
                     return
-                time.sleep(.1)
+                time.sleep(.22)
                 continue
             # 旧逻辑：轮询磁盘会话缓存，等 turnBoundary 关闭。
             seq, text = reply_snapshot(session_id)
@@ -325,7 +368,7 @@ def stream_reply(session_id, previous=0, cancel=None):
                 last = text
                 yield text, True
                 return
-            time.sleep(.1)
+            time.sleep(.22)
     raise TimeoutError('DSH 已接收消息，但尚未等到完整回复')
 
 
@@ -376,7 +419,7 @@ def listen():
     def dialogue_worker():
         while not stopped.is_set():
             try:
-                audio, config, cancel = jobs.get(timeout=.2)
+                audio, config, cancel = jobs.get(timeout=.4)
             except queue.Empty:
                 continue
             try:
@@ -404,11 +447,20 @@ def listen():
                     tail = answer[spoken_len:]
                     if tail.strip():
                         report(cancel, '正在合成回复', text=text)
-                        output = synthesize(config['tts_provider'], tail, voice)
+                        try:
+                            output = synthesize(config['tts_provider'], tail, voice)
+                        except Exception as err:
+                            report(cancel, '合成失败：' + str(err), text=text)
+                            break
                         if cancel.is_set():
                             break
                         report(cancel, '正在播报回复', text=text)
-                        if not play(output, speaker, cancel):
+                        try:
+                            played = play(output, speaker, cancel)
+                        except Exception as err:
+                            report(cancel, '播放失败：' + str(err), text=text)
+                            break
+                        if not played:
                             break
                         spoken_len = len(answer)
                     if finished:

@@ -12,6 +12,28 @@ from 麦克风波纹 import MicrophoneMeter
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / '语音设置.json'
 
+def _focus_existing_settings():
+    """已有设置窗则前置并退出；用窗口标题匹配。"""
+    user32 = ctypes.windll.user32
+    found = ctypes.c_void_p()
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def enum_proc(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+        if buf.value == '桌宠语音设置':
+            found.value = hwnd
+            return False
+        return True
+    user32.EnumWindows(enum_proc, 0)
+    if found.value:
+        user32.ShowWindow(found.value, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(found.value)
+        return True
+    return False
+
+
 def main():
     # 必须在创建任何窗口之前声明 DPI 感知，避免 Windows 拉伸位图。
     try:
@@ -24,6 +46,17 @@ def main():
             ctypes.windll.user32.SetProcessDPIAware()
         except (AttributeError, OSError):
             pass
+    # 单实例：端口锁；已开则聚焦旧窗并退出，避免多窗空转吃 CPU。
+    import socket
+    _settings_lock = socket.socket()
+    try:
+        _settings_lock.bind(('127.0.0.1', 19391))
+    except OSError:
+        try:
+            _focus_existing_settings()
+        except Exception:
+            pass
+        return
     config = json.loads(CONFIG.read_text(encoding='utf-8')) if CONFIG.exists() else {}
     app = tk.Tk()
     dpi = app.winfo_fpixels('1i')
@@ -213,7 +246,7 @@ def main():
     vision_frame = ttk.LabelFrame(left, text='屏幕视觉', padding=8)
     vision_frame.pack(fill='x', padx=6, pady=6)
     vision_enabled = tk.BooleanVar(value=bool(config.get('vision_enabled', False)))
-    vision_interval = tk.StringVar(value=str(config.get('vision_interval_sec', 0.5)))
+    vision_interval = tk.StringVar(value=str(config.get('vision_interval_sec', 2)))
     vision_cooldown = tk.StringVar(value=str(config.get('vision_cooldown_sec', 8)))
     vision_model = tk.StringVar(value=str(config.get('vision_model', 'qwen3-vl-plus')))
     vision_status = tk.StringVar(value='关闭时不截图；开启后只保留最新一帧。间隔改完点保存；已开视觉则下次勾选/重启进程生效。')
@@ -224,7 +257,7 @@ def main():
     vision_interval_box = ttk.Combobox(
         vision_row,
         textvariable=vision_interval,
-        values=('0.5', '1', '2', '3'),
+        values=('0.5', '1', '2', '3', '5', '10', '30'),
         width=6,
     )
     vision_interval_box.pack(side='left', padx=(4, 12))
@@ -235,22 +268,44 @@ def main():
     ttk.Entry(vision_row, textvariable=vision_model).pack(side='left', fill='x', expand=True, padx=(4, 0))
     ttk.Label(vision_frame, textvariable=vision_status, style='Subtitle.TLabel', wraplength=int(460 * ui_scale)).pack(anchor='w', pady=(6, 0))
     ttk.Label(vision_frame, text='密钥沿用已保存的云端 Key（默认阿里百炼 VL Flash）；失败不拖垮聊天。', style='Subtitle.TLabel', wraplength=int(460 * ui_scale)).pack(anchor='w', pady=(2, 0))
+    after_ids = {'vision': None, 'listener': None}
+    def _cancel_afters():
+        for key, aid in list(after_ids.items()):
+            if aid is not None:
+                try:
+                    app.after_cancel(aid)
+                except Exception:
+                    pass
+                after_ids[key] = None
     def poll_vision_status():
         try:
+            if not app.winfo_exists():
+                return
             sp = ROOT / 'screen_state.json'
             if not vision_enabled.get():
                 vision_status.set('已关闭：不截图、不注入。')
+                delay = 5000
             elif sp.exists():
                 info = json.loads(sp.read_text(encoding='utf-8-sig'))
                 if info.get('ok'):
                     vision_status.set('看到：' + str(info.get('summary') or '').replace('\n', ' ')[:80])
                 else:
                     vision_status.set('视觉待命/失败：' + str(info.get('summary') or 'ok=false')[:60])
+                # 开视觉时：失焦降到 5s，聚焦 2s
+                try:
+                    focused = bool(app.focus_displayof())
+                except Exception:
+                    focused = True
+                delay = 2000 if focused else 5000
             else:
                 vision_status.set('尚未产生 screen_state（请用右键菜单打开屏幕视觉）。')
+                delay = 5000
         except (OSError, ValueError):
             vision_status.set('状态读取失败（已忽略）。')
-        app.after(1000, poll_vision_status)
+            delay = 5000
+        except tk.TclError:
+            return
+        after_ids['vision'] = app.after(delay, poll_vision_status)
     poll_vision_status()
 
     ttk.Label(left, text='右键开启监听后，识别文字会直接发送到绑定对话。', style='Subtitle.TLabel', wraplength=int(480 * ui_scale)).pack(anchor='w', padx=6, pady=(8, 3))
@@ -332,6 +387,8 @@ def main():
     last_listener_update = [0]
     def poll_listener():
         try:
+            if not app.winfo_exists():
+                return
             path = ROOT / '监听状态.json'
             if path.exists():
                 info = json.loads(path.read_text(encoding='utf-8'))
@@ -342,9 +399,16 @@ def main():
                         recognized_text.set('识别文字：' + info['text'].replace('\n', ' '))
                         test_text.delete('1.0', 'end')
                         test_text.insert('1.0', info['text'])
+            try:
+                focused = bool(app.focus_displayof())
+            except Exception:
+                focused = True
+            delay = 1500 if focused else 5000
         except (OSError, ValueError):
-            pass
-        app.after(1000, poll_listener)
+            delay = 5000
+        except tk.TclError:
+            return
+        after_ids['listener'] = app.after(delay, poll_listener)
     poll_listener()
     voice_mount = ttk.LabelFrame(right_column, text='音色设置与试听', padding=4)
     voice_mount.pack(fill='both', expand=True)
@@ -379,9 +443,9 @@ def main():
         data['interrupt_db'] = round(interrupt_db.get())
         data['vision_enabled'] = bool(vision_enabled.get())
         try:
-            data['vision_interval_sec'] = max(0.4, float(vision_interval.get() or 0.5))
+            data['vision_interval_sec'] = max(0.4, float(vision_interval.get() or 2))
         except ValueError:
-            data['vision_interval_sec'] = 0.5
+            data['vision_interval_sec'] = 2
         try:
             data['vision_cooldown_sec'] = max(1.0, float(vision_cooldown.get() or 8))
         except ValueError:
@@ -395,6 +459,24 @@ def main():
         messagebox.showinfo('桌宠', '设置已保存。监听与屏幕视觉开关位于桌宠右键菜单。')
     ttk.Button(left, text='保存设置', style='Accent.TButton', command=save).pack(fill='x', padx=12, pady=12)
     refresh()
+    def on_close():
+        _cancel_afters()
+        try:
+            meter.stop()
+        except Exception:
+            pass
+        try:
+            meter.closed = True
+            if getattr(meter, 'timer', None):
+                app.after_cancel(meter.timer)
+        except Exception:
+            pass
+        try:
+            _settings_lock.close()
+        except Exception:
+            pass
+        app.destroy()
+    app.protocol('WM_DELETE_WINDOW', on_close)
     app.mainloop()
 
 if __name__ == '__main__':

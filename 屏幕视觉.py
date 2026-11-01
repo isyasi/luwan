@@ -81,9 +81,9 @@ def fingerprint(jpeg: bytes) -> str:
         return hashlib.md5(jpeg).hexdigest()
 
 
-def capture_jpeg(max_width=1280, quality=55) -> bytes | None:
+def capture_jpeg(max_width=960, quality=40, bbox=None) -> bytes | None:
     try:
-        img = ImageGrab.grab()
+        img = ImageGrab.grab(bbox=bbox) if bbox else ImageGrab.grab()
         if img.mode != 'RGB':
             img = img.convert('RGB')
         w, h = img.size
@@ -317,9 +317,9 @@ def _capture_loop(interval: float):
     while not _stop.is_set():
         cfg = _load_config()
         if not cfg.get('vision_enabled'):
-            _stop.wait(0.5)
+            _stop.wait(2.0)
             continue
-        interval = max(0.4, float(cfg.get('vision_interval_sec', 0.5) or 0.5))
+        interval = max(0.4, float(cfg.get('vision_interval_sec', 30) or 30))
         jpeg = capture_jpeg()
         if jpeg:
             fp = fingerprint(jpeg)
@@ -340,9 +340,9 @@ def _analyze_loop():
             if not cfg.get('vision_enabled'):
                 write_screen_state(ok=False, summary='视觉已关闭', detail='vision_enabled=false')
                 last_fp = ''
-                _stop.wait(0.8)
+                _stop.wait(2.0)
                 continue
-            interval = max(0.4, float(cfg.get('vision_interval_sec', 0.5) or 0.5))
+            interval = max(0.4, float(cfg.get('vision_interval_sec', 30) or 30))
             with _latest_lock:
                 jpeg = _latest.get('jpeg')
                 fp = _latest.get('fp') or ''
@@ -357,12 +357,12 @@ def _analyze_loop():
                 write_screen_state(**{k: refreshed[k] for k in (
                     'ok', 'ts', 'hash', 'summary', 'detail', 'event_id', 'worthy'
                 )})
-                _stop.wait(0.5)
+                _stop.wait(min(2.0, max(0.8, interval * 0.25)))
                 continue
             # 视频等场景指纹会抖：眼睛 API 仍按间隔节流，始终只看最新槽
             now = time.time()
             if now - last_eyes_at < interval:
-                _stop.wait(0.2)
+                _stop.wait(0.4)
                 continue
             last_eyes_at = now
             eyes = call_eyes(jpeg, cfg)
@@ -413,7 +413,7 @@ def _analyze_loop():
                 pass
             _stop.wait(1.0)
             continue
-        _stop.wait(0.2)
+        _stop.wait(0.5)
 
 
 def run():
@@ -427,7 +427,7 @@ def run():
         write_screen_state(ok=False, summary='视觉已关闭', detail='vision_enabled=false')
         # 仍保持进程：轮询开关，便于菜单启停共用一个常驻进程；若由壳按开关拉起也可
     try:
-        threading.Thread(target=_capture_loop, args=(float(cfg.get('vision_interval_sec', 0.5) or 0.5),), daemon=True).start()
+        threading.Thread(target=_capture_loop, args=(float(cfg.get('vision_interval_sec', 30) or 30),), daemon=True).start()
         threading.Thread(target=_analyze_loop, daemon=True).start()
         while not _stop.is_set():
             cfg = _load_config()
@@ -436,9 +436,9 @@ def run():
                 with _latest_lock:
                     _latest['jpeg'] = None
                     _latest['fp'] = ''
-                time.sleep(0.8)
+                time.sleep(2.0)
                 continue
-            time.sleep(0.5)
+            time.sleep(1.0)
     except Exception:
         write_screen_state(ok=False, summary='视觉进程退出', detail='fatal_swallowed')
     finally:
