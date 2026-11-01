@@ -14,6 +14,39 @@ if ($Check) {
     foreach ($name in $idle + @('speak_v1')) { "$name : $((Get-Frames $name).Count) 帧" }
     exit 0
 }
+# 单实例：已有桌宠则前置旧窗并退出，避免多开空转吃满 CPU
+Add-Type -Namespace WhalePet -Name Native -MemberDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class Native {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+}
+"@
+$script:petMutex = New-Object System.Threading.Mutex($false, 'Global\XiaojingyuDesktopPet')
+if (-not $script:petMutex.WaitOne(0)) {
+    $found = [IntPtr]::Zero
+    $callback = [WhalePet.Native+EnumWindowsProc]{
+        param([IntPtr]$h, [IntPtr]$l)
+        if (-not [WhalePet.Native]::IsWindowVisible($h)) { return $true }
+        $sb = New-Object System.Text.StringBuilder 256
+        [void][WhalePet.Native]::GetWindowText($h, $sb, 256)
+        if ($sb.ToString() -eq '桌宠') { $script:foundHwnd = $h; return $false }
+        return $true
+    }
+    $script:foundHwnd = [IntPtr]::Zero
+    [WhalePet.Native]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+    if ($script:foundHwnd -ne [IntPtr]::Zero) {
+        [WhalePet.Native]::ShowWindow($script:foundHwnd, 9) | Out-Null
+        [WhalePet.Native]::SetForegroundWindow($script:foundHwnd) | Out-Null
+    }
+    exit 0
+}
+
 Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
 $window = New-Object Windows.Window
 $window.Title = '桌宠'
@@ -288,6 +321,7 @@ if ($needLocalTts) {
 }
 $window.Add_Closed({
     $timer.Stop(); $captionTimer.Stop()
+    try { if ($script:petMutex) { $script:petMutex.ReleaseMutex(); $script:petMutex.Dispose() } } catch {}
     try {
         if ($script:ttsProcess -and -not $script:ttsProcess.HasExited) {
             Stop-Process -Id $script:ttsProcess.Id -Force -ErrorAction SilentlyContinue

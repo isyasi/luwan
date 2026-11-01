@@ -333,7 +333,7 @@ def main():
         style='Subtitle.TLabel',
         wraplength=int(460 * ui_scale),
     ).pack(anchor='w', pady=(2, 0))
-    after_ids = {'vision': None, 'listener': None}
+    after_ids = {'vision': None, 'listener': None, 'parent': None}
     def _cancel_afters():
         for key, aid in list(after_ids.items()):
             if aid is not None:
@@ -449,6 +449,8 @@ def main():
     feedback.pack(fill='x')
     ttk.Label(feedback, textvariable=result, style='Subtitle.TLabel', width=28, anchor='w').pack(fill='x')
     ttk.Label(feedback, textvariable=recognized_text, width=28, anchor='w').pack(fill='x', pady=(4, 0))
+
+
     last_listener_update = [0]
     def poll_listener():
         try:
@@ -561,6 +563,53 @@ def main():
         except Exception:
             pass
         app.destroy()
+
+    def _pet_shell_alive():
+        """桌宠主窗是否还在（标题=桌宠）。"""
+        user32 = ctypes.windll.user32
+        found = ctypes.c_bool(False)
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def enum_proc(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, buf, 256)
+            if buf.value == '桌宠':
+                found.value = True
+                return False
+            return True
+        user32.EnumWindows(enum_proc, 0)
+        return bool(found.value)
+
+    def poll_parent_alive():
+        """主壳退出则关掉设置窗；失焦停麦指示，聚焦再开。"""
+        try:
+            if not app.winfo_exists():
+                return
+            if not _pet_shell_alive():
+                on_close()
+                return
+            try:
+                focused = bool(app.focus_displayof())
+            except Exception:
+                focused = False
+            try:
+                if focused:
+                    if meter.stream is None and not meter.closed:
+                        meter.start()
+                else:
+                    if meter.stream is not None:
+                        meter.stop()
+            except Exception:
+                pass
+            after_ids['parent'] = app.after(3000 if focused else 5000, poll_parent_alive)
+        except tk.TclError:
+            return
+        except Exception:
+            after_ids['parent'] = app.after(8000, poll_parent_alive)
+
+    after_ids.setdefault('parent', None)
+    poll_parent_alive()
     app.protocol('WM_DELETE_WINDOW', on_close)
     app.mainloop()
 

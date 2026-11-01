@@ -84,7 +84,13 @@ class MicrophoneMeter:
             height = (2 + 20*self.level*weight) * self.scale
             x, y = (3+i*6)*self.scale, 12.5*self.scale
             self.canvas.create_line(x, y-height/2, x, y+height/2, fill='#328EAC' if self.stream else '#A6B7C2', width=max(2, 2*self.scale), capstyle='round')
-        self.timer = self.app.after(120, self.draw)  # 降 CPU：指示条不必 50ms
+        if self.stream is None:
+            tick = 800
+        elif self.level < 0.04:
+            tick = 400
+        else:
+            tick = 120
+        self.timer = self.app.after(tick, self.draw)
 
     def analyze(self, rate, stop):
         try:
