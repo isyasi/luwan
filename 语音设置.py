@@ -216,12 +216,19 @@ def main():
     vision_interval = tk.StringVar(value=str(config.get('vision_interval_sec', 0.5)))
     vision_cooldown = tk.StringVar(value=str(config.get('vision_cooldown_sec', 8)))
     vision_model = tk.StringVar(value=str(config.get('vision_model', 'qwen3-vl-plus')))
-    vision_status = tk.StringVar(value='关闭时不截图；开启后只保留最新一帧。')
+    vision_status = tk.StringVar(value='关闭时不截图；开启后只保留最新一帧。间隔改完点保存；已开视觉则下次勾选/重启进程生效。')
     ttk.Checkbutton(vision_frame, text='启用屏幕视觉（Latest-Frame → Flash 眼睛）', variable=vision_enabled).pack(anchor='w')
     vision_row = ttk.Frame(vision_frame)
     vision_row.pack(fill='x', pady=(6, 0))
-    ttk.Label(vision_row, text='间隔秒').pack(side='left')
-    ttk.Entry(vision_row, textvariable=vision_interval, width=6).pack(side='left', padx=(4, 12))
+    ttk.Label(vision_row, text='截图间隔(秒)').pack(side='left')
+    vision_interval_box = ttk.Combobox(
+        vision_row,
+        textvariable=vision_interval,
+        values=('0.5', '1', '2', '3'),
+        width=6,
+    )
+    vision_interval_box.pack(side='left', padx=(4, 12))
+    # Combobox 可编辑：可选预设，也可手填自定义秒数
     ttk.Label(vision_row, text='开口冷却秒').pack(side='left')
     ttk.Entry(vision_row, textvariable=vision_cooldown, width=6).pack(side='left', padx=(4, 12))
     ttk.Label(vision_row, text='模型').pack(side='left')
