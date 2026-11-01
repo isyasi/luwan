@@ -213,7 +213,7 @@ def main():
     vision_frame = ttk.LabelFrame(left, text='屏幕视觉', padding=8)
     vision_frame.pack(fill='x', padx=6, pady=6)
     vision_enabled = tk.BooleanVar(value=bool(config.get('vision_enabled', False)))
-    vision_interval = tk.StringVar(value=str(config.get('vision_interval_sec', 1)))
+    vision_interval = tk.StringVar(value=str(config.get('vision_interval_sec', 0.5)))
     vision_cooldown = tk.StringVar(value=str(config.get('vision_cooldown_sec', 8)))
     vision_model = tk.StringVar(value=str(config.get('vision_model', 'qwen3-vl-plus')))
     vision_status = tk.StringVar(value='关闭时不截图；开启后只保留最新一帧。')
@@ -372,9 +372,9 @@ def main():
         data['interrupt_db'] = round(interrupt_db.get())
         data['vision_enabled'] = bool(vision_enabled.get())
         try:
-            data['vision_interval_sec'] = max(0.4, float(vision_interval.get() or 1))
+            data['vision_interval_sec'] = max(0.4, float(vision_interval.get() or 0.5))
         except ValueError:
-            data['vision_interval_sec'] = 1
+            data['vision_interval_sec'] = 0.5
         try:
             data['vision_cooldown_sec'] = max(1.0, float(vision_cooldown.get() or 8))
         except ValueError:

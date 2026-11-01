@@ -319,7 +319,7 @@ def _capture_loop(interval: float):
         if not cfg.get('vision_enabled'):
             _stop.wait(0.5)
             continue
-        interval = max(0.4, float(cfg.get('vision_interval_sec', 1) or 1))
+        interval = max(0.4, float(cfg.get('vision_interval_sec', 0.5) or 0.5))
         jpeg = capture_jpeg()
         if jpeg:
             fp = fingerprint(jpeg)
@@ -342,7 +342,7 @@ def _analyze_loop():
                 last_fp = ''
                 _stop.wait(0.8)
                 continue
-            interval = max(0.4, float(cfg.get('vision_interval_sec', 1) or 1))
+            interval = max(0.4, float(cfg.get('vision_interval_sec', 0.5) or 0.5))
             with _latest_lock:
                 jpeg = _latest.get('jpeg')
                 fp = _latest.get('fp') or ''
@@ -427,7 +427,7 @@ def run():
         write_screen_state(ok=False, summary='视觉已关闭', detail='vision_enabled=false')
         # 仍保持进程：轮询开关，便于菜单启停共用一个常驻进程；若由壳按开关拉起也可
     try:
-        threading.Thread(target=_capture_loop, args=(float(cfg.get('vision_interval_sec', 1) or 1),), daemon=True).start()
+        threading.Thread(target=_capture_loop, args=(float(cfg.get('vision_interval_sec', 0.5) or 0.5),), daemon=True).start()
         threading.Thread(target=_analyze_loop, daemon=True).start()
         while not _stop.is_set():
             cfg = _load_config()
